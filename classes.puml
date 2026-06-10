@@ -1,0 +1,154 @@
+@startuml Station Météo — Diagramme de classes
+
+skinparam classAttributeIconSize 0
+skinparam classBorderColor #555
+skinparam classBackgroundColor #fafafa
+skinparam classHeaderBackgroundColor #e8eaf6
+skinparam arrowColor #555
+skinparam noteBackgroundColor #fffde7
+skinparam noteBorderColor #aaa
+
+title Station Météo Newton — Diagramme de classes
+
+' ─────────────────────────────────────────
+' Structures de données (dicts typés)
+' ─────────────────────────────────────────
+
+class SensorPoint <<dataclass>> {
+    + _time : str
+    + _value : float | str
+    + _field : str
+    + _measurement : str
+    + location : str
+}
+
+class SensorReading <<dataclass>> {
+    + value : float | str
+    + unit : str
+    + time : str
+}
+
+class AlertThreshold <<dataclass>> {
+    + min : float | None
+    + max : float | None
+}
+
+' ─────────────────────────────────────────
+' Module server.py
+' ─────────────────────────────────────────
+
+class ServerModule <<module>> {
+    ' --- Configuration ---
+    + BASE_URL : str
+    + NUMERIC_FIELDS : list[str]
+    + TEXT_FIELDS : list[str]
+    + SNAPSHOT_FIELDS : list[str]
+    + UNITS : dict[str, str]
+    + ALERT_THRESHOLDS : dict[str, AlertThreshold]
+    + OFFLINE_MINUTES : int = 30
+    + RAIN_THRESHOLD : float = 0.0
+    + mcp : FastMCP
+    ' --- Helpers privés ---
+    - _fetch(field, duration) : tuple[str, list[SensorPoint]]
+    - _last(points) : SensorPoint | None
+    - _parse_ts(ts) : datetime
+    - _evaluate_alerts(snapshot) : list[str]
+    ' --- Outils MCP exposés ---
+    + get_current_snapshot() : str
+    + get_field_history(field, duration) : str
+    + check_alerts() : str
+}
+
+note right of ServerModule
+  get_current_snapshot(),
+  get_field_history() et
+  check_alerts() sont décorés
+  @mcp.tool() — exposés
+  aux clients MCP
+end note
+
+' ─────────────────────────────────────────
+' Module alert_checker.py
+' ─────────────────────────────────────────
+
+class AlertCheckerModule <<module>> {
+    ' --- Configuration (partagée) ---
+    + BASE_URL : str
+    + SNAPSHOT_FIELDS : list[str]
+    + UNITS : dict[str, str]
+    + ALERT_THRESHOLDS : dict[str, AlertThreshold]
+    + OFFLINE_MINUTES : int = 30
+    + RAIN_THRESHOLD : float = 0.0
+    ' --- Fonctions ---
+    - fetch(field) : tuple[str, list[SensorPoint]]
+    - last(points) : SensorPoint | None
+    - parse_ts(ts) : datetime
+    + get_snapshot() : dict[str, SensorReading]
+    + evaluate_alerts(snapshot) : list[str]
+    + notify_macos(title, message) : None
+    + main() : None
+}
+
+note right of AlertCheckerModule
+  Conçu pour être exécuté
+  par le LaunchAgent toutes
+  les 20 min (StartInterval=1200)
+end note
+
+' ─────────────────────────────────────────
+' Dépendances externes
+' ─────────────────────────────────────────
+
+class FastMCP <<external>> {
+    + tool()
+    + run()
+}
+
+class "httpx.AsyncClient" <<external>> {
+    + get(url, params) : Response
+}
+
+class WeatherAPI <<external>> {
+    + BASE_URL : https://weatherstation.cielnewton.fr
+    + GET /api/data/{field}?duration : list[SensorPoint]
+}
+
+class "macOS osascript" <<external>> {
+    + display notification(msg, title, sound)
+}
+
+class LaunchAgent <<system>> {
+    + Label : fr.cielnewton.meteo-alerts
+    + StartInterval : 1200
+    + RunAtLoad : true
+    + StandardOutPath : /tmp/meteo-alerts.log
+}
+
+class "Claude\n(Desktop / Code)" <<client>> {
+    + Appelle les outils MCP
+}
+
+' ─────────────────────────────────────────
+' Relations
+' ─────────────────────────────────────────
+
+ServerModule *-- FastMCP : mcp =
+ServerModule ..> AlertThreshold : utilise
+ServerModule ..> SensorPoint : manipule
+ServerModule ..> SensorReading : produit
+ServerModule --> "httpx.AsyncClient" : appelle (_fetch)
+ServerModule --> WeatherAPI : GET /api/data/{field}
+
+AlertCheckerModule ..> AlertThreshold : utilise
+AlertCheckerModule ..> SensorPoint : manipule
+AlertCheckerModule ..> SensorReading : produit
+AlertCheckerModule --> "httpx.AsyncClient" : appelle (fetch)
+AlertCheckerModule --> WeatherAPI : GET /api/data/{field}
+AlertCheckerModule --> "macOS osascript" : notify_macos()
+
+LaunchAgent --> AlertCheckerModule : exécute (toutes les 20 min)
+"Claude\n(Desktop / Code)" --> ServerModule : appelle via MCP
+
+SensorPoint --> SensorReading : transformé par _last() / last()
+
+@enduml

@@ -1,16 +1,34 @@
 """Serveur MCP — Station météo LoRaWAN du Lycée Newton (Clichy).
 
-Expose deux outils à tout client MCP (Claude Desktop, Claude Code…) :
+Expose trois outils à tout client MCP (Claude Desktop, Claude Code…) :
 - get_current_snapshot : dernier relevé de tous les capteurs
 - get_field_history    : historique d'un capteur avec min/max/moyenne
+- check_alerts         : vérifie les seuils et retourne les alertes actives
 """
 
 from typing import Literal
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
 import asyncio
+import os
 import httpx
 from fastmcp import FastMCP
 
 BASE_URL = "https://weatherstation.cielnewton.fr"
+
+
+def _api_key() -> str:
+    """Clé API : variable d'environnement WEATHER_API_KEY, sinon fichier .api_key
+    à côté de ce script (gitignoré)."""
+    key = os.environ.get("WEATHER_API_KEY", "")
+    if not key:
+        key_file = Path(__file__).parent / ".api_key"
+        if key_file.exists():
+            key = key_file.read_text()
+    return key.strip()
+
+
+HEADERS = {"X-API-Key": _api_key()}
 
 NUMERIC_FIELDS = [
     "temperature",        # °C  (BME680)
@@ -49,13 +67,23 @@ FieldName = Literal[
     "avgDirectionCardinal", "maxSpeedDirectionCardinal",
 ]
 
+# --- Seuils d'alerte (modifiables) ---
+ALERT_THRESHOLDS = {
+    "temperature":    {"min": -5.0,  "max": 35.0},
+    "batteryVoltage": {"min": 3.5,   "max": None},
+    "iaq":            {"min": None,  "max": 200.0},
+    "humidity":       {"min": None,  "max": 90.0},
+}
+OFFLINE_MINUTES = 30   # Station considérée hors ligne après X min sans donnée
+RAIN_THRESHOLD = 0.0   # rainfall > seuil → alerte pluie
+
 mcp = FastMCP("Station Météo Newton")
 
 
 async def _fetch(field: str, duration: str) -> tuple[str, list[dict]]:
     try:
         async with httpx.AsyncClient(timeout=10.0) as c:
-            r = await c.get(f"{BASE_URL}/api/data/{field}", params={"duration": duration})
+            r = await c.get(f"{BASE_URL}/api/data/{field}", params={"duration": duration}, headers=HEADERS)
             r.raise_for_status()
             return field, r.json()
     except Exception:
@@ -126,6 +154,66 @@ def get_field_history(field: FieldName, duration: str) -> str:
         for p in points:
             lines.append(f"  {p.get('_time')} → {p.get('_value')} {unit}")
     return "\n".join(lines)
+
+
+def _parse_ts(ts: str) -> datetime:
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+
+def _evaluate_alerts(snapshot: dict) -> list[str]:
+    alerts = []
+    now = datetime.now(timezone.utc)
+
+    # Station hors ligne ?
+    times = [_parse_ts(v["time"]) for v in snapshot.values() if v]
+    if not times:
+        alerts.append("Station HORS LIGNE — aucune donnée disponible")
+        return alerts
+    age = (now - max(times)).total_seconds() / 60
+    if age > OFFLINE_MINUTES:
+        alerts.append(f"Station HORS LIGNE — dernier relevé il y a {age:.0f} min")
+
+    # Seuils numériques
+    for field, bounds in ALERT_THRESHOLDS.items():
+        data = snapshot.get(field)
+        if not data or not isinstance(data.get("value"), (int, float)):
+            continue
+        v = data["value"]
+        unit = UNITS.get(field, "")
+        decimals = 2 if field == "batteryVoltage" else 1
+        vstr = f"{v:.{decimals}f}"
+        if bounds["min"] is not None and v < bounds["min"]:
+            alerts.append(f"{field} BAS : {vstr}{unit} (seuil min {bounds['min']}{unit})")
+        if bounds["max"] is not None and v > bounds["max"]:
+            alerts.append(f"{field} ÉLEVÉ : {vstr}{unit} (seuil max {bounds['max']}{unit})")
+
+    # Pluie
+    rain = snapshot.get("rainfall")
+    if rain and isinstance(rain.get("value"), (int, float)) and rain["value"] > RAIN_THRESHOLD:
+        alerts.append(f"Pluie détectée : {rain['value']:.1f} mm")
+
+    return alerts
+
+
+@mcp.tool()
+def check_alerts() -> str:
+    """Vérifie les seuils d'alerte de la station météo et retourne les alertes actives.
+    Contrôle : température hors plage, batterie faible, IAQ élevé, humidité élevée,
+    station hors ligne, pluie détectée. Retourne 'Aucune alerte' si tout est normal."""
+
+    async def _all():
+        return await asyncio.gather(*[_fetch(f, "-1h") for f in SNAPSHOT_FIELDS])
+
+    results = asyncio.run(_all())
+    snapshot = {}
+    for field, points in results:
+        latest = _last(points)
+        snapshot[field] = {"value": latest["_value"], "unit": UNITS.get(field, ""), "time": latest["_time"]} if latest else None
+
+    alerts = _evaluate_alerts(snapshot)
+    if not alerts:
+        return "Aucune alerte — tous les capteurs sont dans les seuils normaux."
+    return "ALERTES ACTIVES :\n" + "\n".join(f"  ⚠ {a}" for a in alerts)
 
 
 if __name__ == "__main__":

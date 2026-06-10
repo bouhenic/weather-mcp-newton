@@ -1,0 +1,113 @@
+@startuml Station Météo — Diagramme de séquence
+
+skinparam sequenceArrowThickness 2
+skinparam sequenceParticipantBorderColor #555
+skinparam sequenceLifeLineBorderColor #999
+skinparam noteBorderColor #aaa
+skinparam noteBackgroundColor #fffde7
+
+title Station Météo Newton — Diagramme de séquence
+
+actor Utilisateur as U
+participant "Claude\n(Desktop / Code)" as C
+participant "Serveur MCP\nserver.py" as MCP
+participant "API Station\ncielnnewton.fr" as API
+participant "macOS\nNotification" as OS
+
+== Requête météo (mode interactif) ==
+
+U -> C : "Quelle est la température ?"
+activate C
+
+C -> MCP : get_current_snapshot()
+activate MCP
+
+loop pour chaque capteur (10 champs en parallèle)
+    MCP -> API : GET /api/data/{field}?duration=-1h
+    API --> MCP : [{_time, _value, ...}]
+end
+
+MCP --> C : Dernier relevé formaté\n(température, humidité, pression…)
+deactivate MCP
+
+C --> U : Réponse en langage naturel
+deactivate C
+
+== Historique d'un capteur ==
+
+U -> C : "Évolution du vent\nces 24 dernières heures ?"
+activate C
+
+C -> MCP : get_field_history("avgSpeed", "-24h")
+activate MCP
+
+MCP -> API : GET /api/data/avgSpeed?duration=-24h
+API --> MCP : [{_time, _value}, ...]
+
+MCP --> C : Min / Max / Moyenne\n+ série temporelle complète
+deactivate MCP
+
+C --> U : Analyse et synthèse
+deactivate C
+
+== Vérification manuelle des alertes ==
+
+U -> C : "Vérifie les alertes"
+activate C
+
+C -> MCP : check_alerts()
+activate MCP
+
+loop pour chaque capteur surveillé (10 champs)
+    MCP -> API : GET /api/data/{field}?duration=-1h
+    API --> MCP : [{_time, _value, ...}]
+end
+
+note over MCP
+  Évalue les seuils :
+  • température < -5°C ou > 35°C
+  • batteryVoltage < 3.5V
+  • IAQ > 200
+  • humidité > 90%
+  • station hors ligne > 30 min
+  • pluie détectée
+end note
+
+alt Alertes détectées
+    MCP --> C : ALERTES ACTIVES :\n⚠ batteryVoltage BAS : 3.48V
+else Tout est normal
+    MCP --> C : Aucune alerte — capteurs dans les seuils normaux.
+end
+deactivate MCP
+
+C --> U : Résumé des alertes
+deactivate C
+
+== Surveillance automatique (toutes les 20 min) ==
+
+participant "LaunchAgent\nmacOS" as LA
+participant "alert_checker.py" as AC
+
+LA -> AC : Déclenche (StartInterval=1200s)
+activate AC
+
+loop pour chaque capteur surveillé (10 champs en parallèle)
+    AC -> API : GET /api/data/{field}?duration=-1h
+    API --> AC : [{_time, _value, ...}]
+end
+
+note over AC
+  Même logique de seuils
+  que check_alerts()
+end note
+
+alt Alertes détectées
+    AC -> OS : osascript display notification\n"batteryVoltage BAS…" ♪ Basso
+    OS --> U : Notification macOS
+    AC -> AC : Log dans /tmp/meteo-alerts.log\n(exit code 1)
+else Tout est normal
+    AC -> AC : Log "OK — aucune alerte"\n(exit code 0)
+end
+deactivate AC
+
+@enduml

@@ -1,8 +1,9 @@
 """Serveur MCP — Station météo LoRaWAN du Lycée Newton (Clichy).
 
-Expose trois outils à tout client MCP (Claude Desktop, Claude Code…) :
+Expose quatre outils à tout client MCP (Claude Desktop, Claude Code…) :
 - get_current_snapshot : dernier relevé de tous les capteurs
 - get_field_history    : historique d'un capteur avec min/max/moyenne
+- get_radio_status     : état du lien radio LoRaWAN (RSSI, SNR, SF, canal…)
 - check_alerts         : vérifie les seuils et retourne les alertes actives
 """
 
@@ -43,9 +44,22 @@ NUMERIC_FIELDS = [
     "batteryVoltage",     # V
     "gas",                # kΩ
     "iaq",
+    # Métadonnées radio LoRaWAN (enveloppe TTN, meilleure passerelle)
+    "rssi",               # dBm
+    "snr",                # dB
+    "spreadingFactor",    # SF7 à SF12
+    "frequency",          # MHz (canal EU868)
+    "gatewayCount",       # passerelles ayant reçu la trame
+    "fCnt",               # compteur de trames
+    "airtime",            # ms
 ]
-TEXT_FIELDS = ["avgDirectionCardinal", "maxSpeedDirectionCardinal"]
+TEXT_FIELDS = ["avgDirectionCardinal", "maxSpeedDirectionCardinal", "gatewayId"]
 ALL_FIELDS = NUMERIC_FIELDS + TEXT_FIELDS
+
+RADIO_FIELDS = [
+    "rssi", "snr", "spreadingFactor", "frequency",
+    "gatewayCount", "gatewayId", "fCnt", "airtime",
+]
 
 SNAPSHOT_FIELDS = [
     "temperature", "tempDS18B20", "humidity", "pressure",
@@ -58,6 +72,8 @@ UNITS = {
     "pressure": "hPa", "rainfall": "mm", "avgSpeed": "km/h",
     "maxSpeed": "km/h", "avgDirection": "°", "maxSpeedDirection": "°",
     "batteryVoltage": "V", "gas": "kΩ", "iaq": "",
+    "rssi": "dBm", "snr": "dB", "spreadingFactor": "",
+    "frequency": "MHz", "gatewayCount": "", "fCnt": "", "airtime": "ms",
 }
 
 FieldName = Literal[
@@ -65,6 +81,8 @@ FieldName = Literal[
     "avgSpeed", "maxSpeed", "avgDirection", "maxSpeedDirection",
     "batteryVoltage", "gas", "iaq",
     "avgDirectionCardinal", "maxSpeedDirectionCardinal",
+    "rssi", "snr", "spreadingFactor", "frequency",
+    "gatewayCount", "gatewayId", "fCnt", "airtime",
 ]
 
 # --- Seuils d'alerte (modifiables) ---
@@ -153,6 +171,52 @@ def get_field_history(field: FieldName, duration: str) -> str:
         ]
         for p in points:
             lines.append(f"  {p.get('_time')} → {p.get('_value')} {unit}")
+    return "\n".join(lines)
+
+
+def _rssi_quality(rssi: float) -> str:
+    if rssi >= -80:
+        return "excellent"
+    if rssi >= -95:
+        return "bon"
+    if rssi >= -110:
+        return "moyen"
+    if rssi >= -120:
+        return "faible"
+    return "limite de réception"
+
+
+@mcp.tool()
+def get_radio_status() -> str:
+    """Retourne l'état du lien radio LoRaWAN de la station : RSSI, SNR,
+    spreading factor, canal (MHz), passerelles en réception, compteur de trames
+    et temps d'antenne. Utiliser pour toute question sur la qualité du signal,
+    la portée ou le réseau LoRaWAN/TTN."""
+
+    async def _all():
+        return await asyncio.gather(*[_fetch(f, "-1h") for f in RADIO_FIELDS])
+
+    results = asyncio.run(_all())
+    snapshot = {field: _last(points) for field, points in results}
+
+    if not any(snapshot.values()):
+        return ("Aucune métadonnée radio récente. La station est peut-être hors ligne, "
+                "ou aucun uplink n'est arrivé depuis 1 h.")
+
+    latest_ts = max(p["_time"] for p in snapshot.values() if p)
+    lines = [f"Lien radio LoRaWAN (dernière trame : {latest_ts})"]
+    for field in RADIO_FIELDS:
+        point = snapshot.get(field)
+        if not point:
+            lines.append(f"  {field}: N/A")
+            continue
+        value, unit = point["_value"], UNITS.get(field, "")
+        if field == "rssi":
+            lines.append(f"  rssi: {value} dBm ({_rssi_quality(value)})")
+        elif field == "spreadingFactor":
+            lines.append(f"  spreadingFactor: SF{value:.0f}")
+        else:
+            lines.append(f"  {field}: {value} {unit}".rstrip())
     return "\n".join(lines)
 
 

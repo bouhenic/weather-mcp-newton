@@ -11,7 +11,10 @@ Capteurs → LoRaWAN → TTN → InfluxDB → API REST → Serveur MCP → Claud
 | Outil | Description |
 |---|---|
 | `get_current_snapshot` | Dernier relevé de tous les capteurs (température, humidité, pression, vent, pluie…) |
-| `get_field_history(field, duration)` | Historique d'un capteur avec min / max / moyenne (-1h à -30d) |
+| `get_field_history(field, duration)` | Historique d'un capteur avec min / max / moyenne (-1h à -30d) — accepte aussi les champs radio (`rssi`, `snr`, `spreadingFactor`…) |
+| `get_radio_status` | État du lien radio LoRaWAN de la station : RSSI, SNR, SF, canal, passerelles, airtime |
+| `get_gateway_traffic(duration)` | Activité de la passerelle : trafic tous réseaux (TTN vs autres), devices distincts, bruit CRC, duty cycle EU868 |
+| `check_alerts` | Vérifie les seuils (température, batterie, IAQ, humidité, hors-ligne, pluie) et retourne les alertes actives |
 
 ## Installation
 

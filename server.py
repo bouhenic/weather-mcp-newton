@@ -1,9 +1,10 @@
 """Serveur MCP — Station météo LoRaWAN du Lycée Newton (Clichy).
 
-Expose quatre outils à tout client MCP (Claude Desktop, Claude Code…) :
+Expose cinq outils à tout client MCP (Claude Desktop, Claude Code…) :
 - get_current_snapshot : dernier relevé de tous les capteurs
 - get_field_history    : historique d'un capteur avec min/max/moyenne
 - get_radio_status     : état du lien radio LoRaWAN (RSSI, SNR, SF, canal…)
+- get_gateway_traffic  : activité de la passerelle (trafic tous réseaux, bruit, duty cycle)
 - check_alerts         : vérifie les seuils et retourne les alertes actives
 """
 
@@ -217,6 +218,92 @@ def get_radio_status() -> str:
             lines.append(f"  spreadingFactor: SF{value:.0f}")
         else:
             lines.append(f"  {field}: {value} {unit}".rstrip())
+    return "\n".join(lines)
+
+
+async def _fetch_json(path: str, params: dict | None = None):
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as c:
+            r = await c.get(f"{BASE_URL}{path}", params=params, headers=HEADERS)
+            r.raise_for_status()
+            return r.json()
+    except Exception:
+        return None
+
+
+def _is_ttn_devaddr(devaddr) -> bool:
+    """Le préfixe 26/27 du DevAddr identifie The Things Network."""
+    return isinstance(devaddr, str) and len(devaddr) == 8 and devaddr[:2] in ("26", "27")
+
+
+@mcp.tool()
+def get_gateway_traffic(duration: str = "-24h") -> str:
+    """Retourne l'activité de la passerelle LoRaWAN du lycée (newton-laird) :
+    trames relayées tous réseaux confondus (The Things Network vs autres opérateurs),
+    devices distincts, downlinks, bruit radio (trames détectées vs CRC valide) et
+    état de connexion TTN (compteurs, duty cycle par sous-bande EU868).
+    Métadonnées radio uniquement — les payloads sont chiffrés de bout en bout.
+    Utiliser pour toute question sur la passerelle, le trafic LoRaWAN local ou
+    l'occupation du spectre. Durées acceptées : -1h, -6h, -24h, -7d (format Flux)."""
+
+    async def _all():
+        return await asyncio.gather(
+            _fetch_json("/api/gateway/traffic", {"duration": duration, "limit": 5000}),
+            _fetch_json("/api/gateway/noise", {"duration": duration, "aggregate": "1h"}),
+            _fetch_json("/api/gateway/stats"),
+        )
+
+    frames, noise, stats = asyncio.run(_all())
+    lines = []
+
+    if frames is None:
+        lines.append(f"Trafic indisponible (durée '{duration}' invalide, ou collecte non configurée).")
+    elif not frames:
+        lines.append(f"Aucune trame relayée sur {duration}.")
+    else:
+        ups = [f for f in frames if f.get("direction") == "up"]
+        downs = [f for f in frames if f.get("direction") == "down"]
+        joins = [f for f in ups if "JOIN" in str(f.get("mtype", ""))]
+        ttn_ups = [f for f in ups if _is_ttn_devaddr(f.get("devAddr"))]
+        by_device: dict[str, int] = {}
+        for f in ups:
+            if f.get("devAddr"):
+                by_device[f["devAddr"]] = by_device.get(f["devAddr"], 0) + 1
+
+        lines.append(f"Trafic passerelle sur {duration} : {len(frames)} trame(s)")
+        lines.append(f"  Uplinks  : {len(ups)} — TTN : {len(ttn_ups)}, autres réseaux : {len(ups) - len(ttn_ups)}"
+                     f" (dont {len(joins)} join request)")
+        lines.append(f"  Downlinks: {len(downs)}")
+        lines.append(f"  Devices distincts : {len(by_device)}")
+        top = sorted(by_device.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        if top:
+            lines.append("  Plus actifs :")
+            for devaddr, count in top:
+                network = "TTN" if _is_ttn_devaddr(devaddr) else "autre réseau"
+                lines.append(f"    {devaddr} ({network}) : {count} trame(s)")
+
+    if noise:
+        rxin = sum(p.get("rxin") or 0 for p in noise)
+        rxok = sum(p.get("rxok") or 0 for p in noise)
+        rxfw = sum(p.get("rxfw") or 0 for p in noise)
+        lines.append(f"Bruit radio : {rxin:.0f} trame(s) détectée(s), {rxok:.0f} CRC valide(s), {rxfw:.0f} relayée(s)"
+                     + (f" — {rxok / rxin * 100:.0f} % de trames valides" if rxin else ""))
+
+    if stats:
+        lines.append("Connexion TTN :")
+        lines.append(f"  Protocole {stats.get('protocol', '?')}, connectée depuis {stats.get('connected_at', '?')}")
+        lines.append(f"  Cumul : {stats.get('uplink_count', '0')} uplinks, {stats.get('downlink_count', '0')} downlinks"
+                     f" — dernier uplink : {stats.get('last_uplink_received_at', 'N/A')}")
+        used = [b for b in stats.get("sub_bands", []) if b.get("downlink_utilization")]
+        for band in used:
+            low = float(band["min_frequency"]) / 1e6
+            high = float(band["max_frequency"]) / 1e6
+            used_pct = band["downlink_utilization"] * 100
+            limit_pct = band.get("downlink_utilization_limit", 0) * 100
+            lines.append(f"  Duty cycle {low:.1f}–{high:.1f} MHz : {used_pct:.4f} % (limite {limit_pct:g} %)")
+    else:
+        lines.append("Stats de connexion TTN indisponibles.")
+
     return "\n".join(lines)
 
 
